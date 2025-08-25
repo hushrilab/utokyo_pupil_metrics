@@ -1,72 +1,82 @@
+#!/usr/bin/env python3
 """
-Pupil Core live pupil-diameter plot + keyboard-controlled recording
+Pupil Core realtime pupil-diameter plot (no export).
 
-Keys:
+Controls in the plot window:
   r -> start recording
-  s -> stop recording
+  t -> stop recording
   q / ESC -> quit
 
 Requirements:
-- Run Pupil Capture and ensure the device is recognized.
-- Enable the 'Pupil Remote' plugin (default REQ port: 50020).
-"""
+- Pupil Capture running, device detected
+- Pupil Remote enabled (default REQ port: 50020)
 
+Example:
+  python pupil_core_plot.py --session-name mytest
+"""
 import time
 import threading
 import collections
-from datetime import datetime
+import argparse
 
 import zmq
 import msgpack
 import matplotlib.pyplot as plt
 
+# ---------- Args ----------
+parser = argparse.ArgumentParser(description="Realtime pupil diameter plot from Pupil Core")
+parser.add_argument("--addr", default="127.0.0.1", help="Pupil Capture host (default: 127.0.0.1)")
+parser.add_argument("--req-port", type=int, default=50020, help="Pupil Remote REQ port (default: 50020)")
+parser.add_argument("--field", choices=["diameter", "diameter_3d"], default="diameter",
+                    help="Which field to plot (default: diameter in px; use diameter_3d for mm if 3D pupil is enabled)")
+parser.add_argument("--conf-thresh", type=float, default=0.6, help="Confidence threshold (default: 0.6)")
+parser.add_argument("--window", type=float, default=60.0, help="Live plot rolling window in seconds (default: 20)")
+parser.add_argument("--session-name", type=str, default=None, help="Custom session name for recordings")
+args = parser.parse_args()
+
 # ---------- Config ----------
-PUPIL_ADDR = "127.0.0.1"
-REQ_PORT = 50020           # Pupil Remote REQ/REP
-CONF_THRESH = 0.6          # filter low-confidence pupil samples
-WINDOW_SECONDS = 20        # plot rolling window length
-UPDATE_INTERVAL = 0.05     # seconds between plot updates (~20 Hz)
+PUPIL_ADDR = args.addr
+REQ_PORT = args.req_port
+CONF_THRESH = args.conf_thresh
+WINDOW_SECONDS = args.window
+FIELD_NAME = args.field
 
 # ---------- Pupil Core Client ----------
 class PupilCoreClient:
     def __init__(self, addr=PUPIL_ADDR, req_port=REQ_PORT):
         self.ctx = zmq.Context.instance()
 
-        # REQ socket — for querying ports
+        # REQ socket to query ports
         self.req = self.ctx.socket(zmq.REQ)
         self.req.connect(f"tcp://{addr}:{req_port}")
 
-        # discover sub/pub ports
+        # discover SUB/PUB ports
         self.req.send_string("SUB_PORT")
         self.sub_port = self.req.recv_string()
 
         self.req.send_string("PUB_PORT")
         self.pub_port = self.req.recv_string()
 
-        # SUB — for data streams
+        # SUB for data
         self.sub = self.ctx.socket(zmq.SUB)
         self.sub.connect(f"tcp://{addr}:{self.sub_port}")
-        # Subscribe to pupil stream (diameter is in these messages)
         self.sub.setsockopt_string(zmq.SUBSCRIBE, "pupil.")
 
-        # PUB — for notifications (e.g., recording control)
+        # PUB for notifications (recording control, etc.)
         self.pub = self.ctx.socket(zmq.PUB)
         self.pub.connect(f"tcp://{addr}:{self.pub_port}")
 
-        # Give sockets a moment to connect
         time.sleep(0.1)
 
-        # Receiver thread state
         self._stop_flag = threading.Event()
         self._thread = None
 
     def start_receiver(self, callback):
-        """Start background thread; callback(topic:str, payload:dict)."""
         def _run():
             poller = zmq.Poller()
             poller.register(self.sub, zmq.POLLIN)
             while not self._stop_flag.is_set():
-                socks = dict(poller.poll(100))  # 100 ms
+                socks = dict(poller.poll(50))  # ms
                 if socks.get(self.sub) == zmq.POLLIN:
                     topic = self.sub.recv_string()
                     payload = msgpack.loads(self.sub.recv(), raw=False)
@@ -80,7 +90,6 @@ class PupilCoreClient:
             self._thread.join(timeout=1.0)
 
     def notify(self, subject: str, **kwargs):
-        """Send Pupil notification via PUB."""
         payload = {"subject": subject, "timestamp": time.time(), **kwargs}
         self.pub.send_string("notify.", flags=zmq.SNDMORE)
         self.pub.send(msgpack.dumps(payload, use_bin_type=True))
@@ -91,120 +100,115 @@ class PupilCoreClient:
         self.pub.close(0)
         self.req.close(0)
 
-# ---------- Live Plot / Main ----------
+# ---------- Live Plot ----------
 def main():
     pc = PupilCoreClient()
 
-    # Deques for rolling window
+    # Live rolling buffers
     ts0 = None
-    times = collections.deque(maxlen=10_000)
-    diam = collections.deque(maxlen=10_000)
+    live_t = collections.deque(maxlen=12_000)
+    live_d = collections.deque(maxlen=12_000)
 
-    recording = {"on": False, "label": ""}
+    # Recording state
+    rec_active = False
+    rec_label = None
 
     def handle_sample(topic, payload):
         nonlocal ts0
-        # Typical keys include: timestamp, confidence, diameter, diameter_3d, id, method, etc.
         conf = payload.get("confidence", 0.0)
-        d = payload.get("diameter", None)  # pixel or mm depending on method; often pixels for 2D
-        t = payload.get("timestamp", None)
-        if t is None or d is None or conf is None:
+        d = payload.get(FIELD_NAME)
+        dev_ts = payload.get("timestamp")
+        if dev_ts is None or d is None or conf is None:
             return
         if conf < CONF_THRESH:
             return
+
         if ts0 is None:
-            ts0 = t
-        times.append(t - ts0)
-        diam.append(d)
+            ts0 = dev_ts
+        live_t.append(dev_ts - ts0)
+        live_d.append(d)
 
     pc.start_receiver(handle_sample)
 
-    # Setup Matplotlib live plot
+    # Matplotlib UI
     plt.ion()
     fig, ax = plt.subplots(figsize=(9, 4.5))
-    ln, = ax.plot([], [], lw=1.5)
+    line, = ax.plot([], [], lw=1.5)
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Pupil diameter")
-    ax.set_title("Pupil diameter (live) — press 'r' to record, 's' to stop, 'q' to quit")
+    ax.set_ylabel("Pupil diameter" + (" (mm)" if FIELD_NAME == "diameter_3d" else " (px)"))
+    ax.set_title("Pupil diameter (live) — r: start, t: stop, q: quit")
 
-    # Status text (top-right)
-    status_text = ax.text(
+    status = ax.text(
         0.98, 0.92, "IDLE",
         transform=ax.transAxes, ha="right", va="center", fontsize=11,
         bbox=dict(boxstyle="round,pad=0.2", fc="none", ec="gray")
     )
 
-    # Keyboard handlers
     def on_key(event):
-        key = (event.key or "").lower()
-        if key in ("q", "escape"):
+        nonlocal rec_active, rec_label
+        k = (event.key or "").lower()
+        if k in ("q", "escape"):
             plt.close(fig)
-        elif key == "r":
-            # Start a recording
-            if not recording["on"]:
-                label = f"pupil-diam-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                pc.notify("recording.should_start", session_name=label)
-                recording["on"] = True
-                recording["label"] = label
-        elif key == "s":
-            # Stop a recording
-            if recording["on"]:
+        elif k == "r":
+            if not rec_active:
+                rec_active = True
+                rec_label = args.session_name or time.strftime("%Y%m%d-%H%M%S")
+                pc.notify("recording.should_start", session_name=f"pupil-diam-{rec_label}")
+                print(f"[REC START] {rec_label}")
+        elif k == "t":  # stop recording
+            if rec_active:
                 pc.notify("recording.should_stop")
-                recording["on"] = False
+                rec_active = False
+                print(f"[REC STOP] {rec_label}")
 
-    fig.canvas.mpl_connect("key_press_event", on_key)
+    cid = fig.canvas.mpl_connect("key_press_event", on_key)
 
-    # Live update loop
     try:
         last_draw = 0.0
         while plt.fignum_exists(fig.number):
             now = time.time()
-            # Throttle updates
-            if now - last_draw >= UPDATE_INTERVAL:
-                # Limit x to rolling window
-                if times:
-                    tmax = times[-1]
+            if now - last_draw >= 0.05:
+                if live_t:
+                    tmax = live_t[-1]
                     tmin = max(0.0, tmax - WINDOW_SECONDS)
-                    # Find starting index in deque (linear scan is fine for this window length)
-                    # For efficiency, convert to list slice once per draw:
-                    t_list = list(times)
-                    d_list = list(diam)
-                    # keep only within window
+                    t_list = list(live_t)
+                    d_list = list(live_d)
+                    # slice to rolling window
                     start_idx = 0
                     for i in range(len(t_list) - 1, -1, -1):
                         if t_list[i] < tmin:
                             start_idx = i + 1
                             break
-                    t_view = t_list[start_idx:]
-                    d_view = d_list[start_idx:]
+                    tv = t_list[start_idx:]
+                    dv = d_list[start_idx:]
 
-                    ln.set_data(t_view, d_view)
-                    if d_view:
+                    line.set_data(tv, dv)
+                    if dv:
                         ax.set_xlim(max(0, tmin), max(1.0, tmax))
-                        ymin = min(d_view)
-                        ymax = max(d_view)
+                        ymin, ymax = min(dv), max(dv)
                         if ymin == ymax:
                             ymin -= 0.5
                             ymax += 0.5
                         ax.set_ylim(ymin, ymax)
 
-                # Update status
-                if recording["on"]:
-                    status_text.set_text(f"REC ● {recording['label']}")
-                    status_text.set_bbox(dict(boxstyle="round,pad=0.2", fc="#ffcccc", ec="#cc0000"))
+                # status badge
+                if rec_active:
+                    status.set_text(f"REC ● {rec_label}")
+                    status.set_bbox(dict(boxstyle="round,pad=0.2", fc="#ffcccc", ec="#cc0000"))
                 else:
-                    status_text.set_text("IDLE")
-                    status_text.set_bbox(dict(boxstyle="round,pad=0.2", fc="none", ec="gray"))
+                    status.set_text("IDLE")
+                    status.set_bbox(dict(boxstyle="round,pad=0.2", fc="none", ec="gray"))
 
                 fig.canvas.draw()
                 fig.canvas.flush_events()
                 last_draw = now
 
-            time.sleep(0.005)
+            # keep GUI responsive
+            plt.pause(0.001)
     finally:
-        # Ensure recording is stopped on exit
-        if recording["on"]:
+        if rec_active:
             pc.notify("recording.should_stop")
+        fig.canvas.mpl_disconnect(cid)
         pc.close()
 
 if __name__ == "__main__":
