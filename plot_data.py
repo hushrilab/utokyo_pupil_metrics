@@ -7,8 +7,10 @@ Plot pupil diameter from a Pupil Capture export with:
   • optional FIXED reference baseline (number or computed from a file),
   • fast offline APCPS (sliding or forward) computed by metrics_pupil.apcps_series()
 
-CSV path template for main session:
-  ~/recordings/<SESSION_NAME>/<SESSION_NUMBER>/exports/<SESSION_NUMBER>/pupil_positions.csv
+Reference-baseline-from-file behavior:
+  - Uses ONLY samples with confidence >= 0.8
+  - Applies the same low-pass cutoff passed via --lp-cutoff-hz (if provided)
+  - Baseline = mean of the filtered signal from that file
 """
 
 import argparse
@@ -60,7 +62,7 @@ def main():
     ap.add_argument("--session-number", type=str, default="000",
                     help="Recording session number folder (default: 000)")
     ap.add_argument("--field", choices=["diameter", "diameter_3d"], default="diameter")
-    # Confidence coloring thresholds
+    # Confidence coloring thresholds (for the trace only)
     ap.add_argument("--thresh-low", type=float, default=0.6)
     ap.add_argument("--thresh-high", type=float, default=0.8)
     # APCPS thresholds (for shading only)
@@ -69,19 +71,19 @@ def main():
     # APCPS window mode (offline)
     ap.add_argument("--forward-apcps", action="store_true",
                     help="Use forward 2.5 s APCPS (next window). Otherwise sliding (last 2.5 s).")
-    # Filtering (applied inside metrics_pupil)
+    # Filtering for MAIN trace/metrics
     ap.add_argument("--conf-thresh", type=float, default=None,
-                    help="Drop samples with confidence below this value (if confidence column available).")
+                    help="Drop samples with confidence below this value in the MAIN file.")
     ap.add_argument("--lp-cutoff-hz", type=float, default=None,
-                    help="Low-pass cutoff in Hz before computing metrics.")
+                    help="Low-pass cutoff in Hz (applied before metrics).")
     ap.add_argument("--use-filtered", action="store_true",
-                    help="Plot the filtered (confidence + low-pass) signal instead of raw.")
+                    help="Plot the filtered (confidence + low-pass) MAIN signal instead of raw.")
     # Reference baseline (mutually exclusive)
     ap.add_argument("--ref-baseline", type=float, default=None,
                     help="Fixed baseline value for percent changes (same units as the signal). Must be non-zero.")
     ap.add_argument("--ref-baseline-file", type=Path, default=None,
-                    help="Path to a positions CSV to compute the reference baseline from "
-                         "(baseline = mean of filtered signal from that file).")
+                    help="Compute baseline from another positions CSV. "
+                         "This baseline uses ONLY confidence >= 0.8 and the same --lp-cutoff-hz.")
     args = ap.parse_args()
 
     # ---- Validate baseline arguments ----
@@ -105,36 +107,40 @@ def main():
             raise FileNotFoundError(f"--ref-baseline-file not found: {args.ref_baseline_file}")
         t_ref, y_ref, c_ref = load_positions_csv(args.ref_baseline_file, args.field)
 
-        # Build a temporary calculator to reuse the same preprocessing settings
+        # Build a temporary calculator to reuse the SAME low-pass as requested,
+        # but FORCE confidence threshold to 0.8 for the baseline-from-file.
         tmp_calc = PCPSCalculator(
-            baseline_win=1.0, apcps_win=2.5, alert_up=args.alert_up, alert_down=args.alert_down,
-            continuous_baseline=True, conf_thresh=args.conf_thresh, lp_cutoff_hz=args.lp_cutoff_hz,
+            baseline_win=1.0, apcps_win=2.5,
+            alert_up=args.alert_up, alert_down=args.alert_down,
+            continuous_baseline=True,
+            conf_thresh=0.8,                 # <-- fixed per your requirement
+            lp_cutoff_hz=args.lp_cutoff_hz,  # <-- reuse same cutoff as main
             reference_baseline=None
         )
         t_ref_proc, y_ref_proc = tmp_calc._preprocess(t_ref, y_ref, confidences=c_ref)
         if len(y_ref_proc) == 0:
-            raise ValueError("After preprocessing, no samples remain to compute the reference baseline from the file.")
+            raise ValueError("After applying conf>=0.8 and low-pass, no samples remain in --ref-baseline-file.")
         ref_baseline_value = float(np.nanmean(y_ref_proc))
-        if ref_baseline_value == 0.0 or not np.isfinite(ref_baseline_value):
+        if not np.isfinite(ref_baseline_value) or ref_baseline_value == 0.0:
             raise ValueError("Computed reference baseline from file is invalid (zero or non-finite).")
 
     # If user passed a numeric baseline, use it
     if args.ref_baseline is not None:
         ref_baseline_value = float(args.ref_baseline)
 
-    # ---- Calculator (offline config) ----
+    # ---- Calculator for MAIN data (offline config) ----
     calc = PCPSCalculator(
         baseline_win=1.0,
         apcps_win=2.5,
         alert_up=args.alert_up,
         alert_down=args.alert_down,
         continuous_baseline=True,            # offline series uses rolling baseline unless ref is provided
-        conf_thresh=args.conf_thresh,
+        conf_thresh=args.conf_thrash if hasattr(args, "conf_thrash") else args.conf_thresh,
         lp_cutoff_hz=args.lp_cutoff_hz,
         reference_baseline=ref_baseline_value
     )
 
-    # ---- Preprocess once (filter + smooth) for plotting if requested ----
+    # ---- Preprocess MAIN once (filter + smooth) for plotting if requested ----
     t_proc, y_proc = calc._preprocess(t_raw, y_raw, confidences=c_raw)
 
     if args.use_filtered:
