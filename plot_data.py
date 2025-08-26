@@ -4,10 +4,10 @@ Plot pupil diameter from a Pupil Capture export with:
   • confidence-colored trace (red/blue/green),
   • APCPS shading only where above/below thresholds,
   • optional confidence filtering and low-pass smoothing (from metrics_pupil),
-  • optional FIXED reference baseline for percent changes,
+  • optional FIXED reference baseline (number or computed from a file),
   • fast offline APCPS (sliding or forward) computed by metrics_pupil.apcps_series()
 
-CSV path template:
+CSV path template for main session:
   ~/recordings/<SESSION_NAME>/<SESSION_NUMBER>/exports/<SESSION_NUMBER>/pupil_positions.csv
 """
 
@@ -40,12 +40,26 @@ def normalize_to_seconds(t: np.ndarray) -> np.ndarray:
         dt = dt / 1e6
     return dt
 
+def load_positions_csv(csv_path: Path, field: str):
+    """Load a pupil_positions.csv and return (t_seconds, y_values, confidence)."""
+    df = pd.read_csv(csv_path, low_memory=False)
+    for col in ["pupil_timestamp", "confidence", field]:
+        if col not in df.columns:
+            raise KeyError(f"Missing column '{col}' in {csv_path}")
+    df = df[["pupil_timestamp", "confidence", field]].dropna()
+    if df.empty:
+        raise ValueError(f"No valid data after dropping NaNs in {csv_path}.")
+    t = normalize_to_seconds(df["pupil_timestamp"].to_numpy())
+    y = pd.to_numeric(df[field], errors="coerce").to_numpy()
+    c = pd.to_numeric(df["confidence"], errors="coerce").to_numpy()
+    return t, y, c
+
 def main():
     ap = argparse.ArgumentParser(description="Plot pupil diameter + APCPS threshold shading")
     ap.add_argument("session_name", type=str, help="Session name under ~/recordings/")
     ap.add_argument("--session-number", type=str, default="000",
                     help="Recording session number folder (default: 000)")
-    ap.add_argument("--field", choices=["diameter", "diameter_3d"], default="diameter_3d")
+    ap.add_argument("--field", choices=["diameter", "diameter_3d"], default="diameter")
     # Confidence coloring thresholds
     ap.add_argument("--thresh-low", type=float, default=0.6)
     ap.add_argument("--thresh-high", type=float, default=0.8)
@@ -62,35 +76,53 @@ def main():
                     help="Low-pass cutoff in Hz before computing metrics.")
     ap.add_argument("--use-filtered", action="store_true",
                     help="Plot the filtered (confidence + low-pass) signal instead of raw.")
-    # NEW: fixed reference baseline (overrides rolling baseline)
+    # Reference baseline (mutually exclusive)
     ap.add_argument("--ref-baseline", type=float, default=None,
-                    help="Fixed baseline value for percent changes (same units as the signal). If set, overrides the previous-1s rolling baseline. Must be non-zero.")
+                    help="Fixed baseline value for percent changes (same units as the signal). Must be non-zero.")
+    ap.add_argument("--ref-baseline-file", type=Path, default=None,
+                    help="Path to a positions CSV to compute the reference baseline from "
+                         "(baseline = mean of filtered signal from that file).")
     args = ap.parse_args()
 
-    # ---- Load CSV ----
+    # ---- Validate baseline arguments ----
+    if args.ref_baseline is not None and args.ref_baseline == 0.0:
+        raise ValueError("--ref-baseline must be non-zero.")
+    if args.ref_baseline is not None and args.ref_baseline_file is not None:
+        raise ValueError("Use only one of --ref-baseline or --ref-baseline-file (they are mutually exclusive).")
+
+    # ---- Paths ----
     csv_path = Path.home() / "recordings" / args.session_name / args.session_number / "exports" / args.session_number / "pupil_positions.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    df = pd.read_csv(csv_path, low_memory=False)
-    for col in ["pupil_timestamp", "confidence", args.field]:
-        if col not in df.columns:
-            raise KeyError(f"Missing column '{col}' in {csv_path}")
+    # ---- Load main session data ----
+    t_raw, y_raw, c_raw = load_positions_csv(csv_path, args.field)
 
-    df = df[["pupil_timestamp", "confidence", args.field]].dropna()
-    if df.empty:
-        raise ValueError("No valid data after dropping NaNs.")
+    # ---- If baseline should come from a file, load & compute it now ----
+    ref_baseline_value = None
+    if args.ref_baseline_file is not None:
+        if not args.ref_baseline_file.exists():
+            raise FileNotFoundError(f"--ref-baseline-file not found: {args.ref_baseline_file}")
+        t_ref, y_ref, c_ref = load_positions_csv(args.ref_baseline_file, args.field)
 
-    # ---- Arrays ----
-    t_raw = normalize_to_seconds(df["pupil_timestamp"].to_numpy())
-    y_raw = pd.to_numeric(df[args.field], errors="coerce").to_numpy()
-    c_raw = pd.to_numeric(df["confidence"], errors="coerce").to_numpy()
+        # Build a temporary calculator to reuse the same preprocessing settings
+        tmp_calc = PCPSCalculator(
+            baseline_win=1.0, apcps_win=2.5, alert_up=args.alert_up, alert_down=args.alert_down,
+            continuous_baseline=True, conf_thresh=args.conf_thresh, lp_cutoff_hz=args.lp_cutoff_hz,
+            reference_baseline=None
+        )
+        t_ref_proc, y_ref_proc = tmp_calc._preprocess(t_ref, y_ref, confidences=c_ref)
+        if len(y_ref_proc) == 0:
+            raise ValueError("After preprocessing, no samples remain to compute the reference baseline from the file.")
+        ref_baseline_value = float(np.nanmean(y_ref_proc))
+        if ref_baseline_value == 0.0 or not np.isfinite(ref_baseline_value):
+            raise ValueError("Computed reference baseline from file is invalid (zero or non-finite).")
 
-    # Validate reference baseline (if given)
-    if args.ref_baseline is not None and args.ref_baseline == 0.0:
-        raise ValueError("--ref-baseline must be non-zero.")
+    # If user passed a numeric baseline, use it
+    if args.ref_baseline is not None:
+        ref_baseline_value = float(args.ref_baseline)
 
-    # ---- Calculator (offline config; rolling baseline is internal, unless ref is set) ----
+    # ---- Calculator (offline config) ----
     calc = PCPSCalculator(
         baseline_win=1.0,
         apcps_win=2.5,
@@ -99,7 +131,7 @@ def main():
         continuous_baseline=True,            # offline series uses rolling baseline unless ref is provided
         conf_thresh=args.conf_thresh,
         lp_cutoff_hz=args.lp_cutoff_hz,
-        reference_baseline=args.ref_baseline
+        reference_baseline=ref_baseline_value
     )
 
     # ---- Preprocess once (filter + smooth) for plotting if requested ----
@@ -132,6 +164,11 @@ def main():
     ax.set_xlabel("Time since start (s)")
     ax.set_ylabel(f"Pupil diameter ({unit})")
 
+    # If using a reference baseline, draw a horizontal line on the left axis
+    if ref_baseline_value is not None:
+        ax.axhline(ref_baseline_value, color="black", ls="--", lw=1.5,
+                   label=f"Reference baseline = {ref_baseline_value:g} {unit}")
+
     # Shading ONLY where APCPS crosses thresholds
     ax2 = ax.twinx()
     ax2.set_ylabel("APCPS (%)")
@@ -142,13 +179,15 @@ def main():
     high_mask = (~np.isnan(ap)) & (ap >  up)
     low_mask  = (~np.isnan(ap)) & (ap < -down)
 
+    # Use t_ap (aligned to apcps_vals) for shading
     ax2.fill_between(t_ap, 0, np.where(high_mask, ap, np.nan),
                      color="red", alpha=0.30, label=f"APCPS > +{up}%")
     ax2.fill_between(t_ap, 0, np.where(low_mask,  ap, np.nan),
                      color="blue", alpha=0.30, label=f"APCPS < -{down}%")
 
     mode_txt = "forward APCPS (next 2.5 s)" if args.forward_apcps else "sliding APCPS (last 2.5 s)"
-    base_txt = f"reference baseline = {args.ref_baseline:g} {unit}" if args.ref_baseline is not None else "continuous 1 s baseline"
+    base_txt = (f"reference baseline = {ref_baseline_value:g} {unit}"
+                if ref_baseline_value is not None else "continuous 1 s baseline")
     filt_txt = " (filtered)" if args.use_filtered else " (raw)"
     ax.set_title(f"Pupil diameter{filt_txt} + APCPS crossings — session: {args.session_name} | {mode_txt}, {base_txt}")
 
@@ -156,7 +195,6 @@ def main():
     ax2.legend(loc="upper right")
     plt.tight_layout()
     plt.show()
-
 
 if __name__ == "__main__":
     main()
