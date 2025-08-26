@@ -40,7 +40,9 @@ def normalize_to_seconds(t: np.ndarray) -> np.ndarray:
 def main():
     ap = argparse.ArgumentParser(description="Plot pupil diameter + APCPS threshold shading")
     ap.add_argument("session_name", type=str, help="Session name under ~/recordings/")
-    ap.add_argument("--field", choices=["diameter", "diameter_3d"], default="diameter")
+    ap.add_argument("--session-number", type=str, default="000",
+                help="Recording session number folder (default: 000)")
+    ap.add_argument("--field", choices=["diameter", "diameter_3d"], default="diameter_3d")
     # Confidence bands for trace coloring
     ap.add_argument("--thresh-low", type=float, default=0.6)
     ap.add_argument("--thresh-high", type=float, default=0.8)
@@ -62,7 +64,8 @@ def main():
     args = ap.parse_args()
 
     # ---- Load CSV ----
-    csv_path = Path.home() / "recordings" / args.session_name / "000" / "exports" / "000" / "pupil_positions.csv"
+    csv_path = (Path.home() / "recordings" / args.session_name / args.session_number / "exports" / args.session_number / "pupil_positions.csv")
+
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
@@ -89,7 +92,7 @@ def main():
         alert_up=args.alert_up,
         alert_down=args.alert_down,
         continuous_baseline=use_continuous,
-        forward_apcps=False,
+        forward_apcps=True,
         conf_thresh=args.conf_thresh,
         lp_cutoff_hz=args.lp_cutoff_hz
     )
@@ -108,8 +111,8 @@ def main():
 
     # ---- Compute APCPS series ----
     apcps_vals = np.full_like(t_plot, np.nan, dtype=float)
-    for i in range(len(t_plot)):
-        m = calc.update(list(t_plot[:i+1]), list(y_plot[:i+1]), confidences=c_plot[:i+1] if len(c_plot)==len(t_plot) else None)
+    for i, (ti, yi, ci) in enumerate(zip(t_plot, y_plot, c_plot)):
+        m = calc.step_update(ti, yi, ci)
         apcps_vals[i] = m.apcps if m.apcps is not None else np.nan
 
     # ---- Plot ----

@@ -43,6 +43,7 @@ from statistics import mean
 from typing import List, Optional, Sequence, Tuple
 import math
 import numpy as np
+import collections
 
 
 # ---------- helpers ----------
@@ -146,6 +147,12 @@ class PCPSCalculator:
         self.onset_t: Optional[float] = None
         self.baseline_value: Optional[float] = None
 
+        # Buffers for incremental updates
+        self._times = collections.deque()
+        self._values = collections.deque()
+        self._confs = collections.deque()
+
+
     # --- configuration setters (optional convenience) ---
     def set_confidence_threshold(self, thresh: Optional[float]):
         self.conf_thresh = thresh
@@ -209,17 +216,33 @@ class PCPSCalculator:
     # --- main update ---
     def update(
         self,
-        times: Sequence[float],
-        values: Sequence[float],
+        times: Optional[Sequence[float]] = None,
+        values: Optional[Sequence[float]] = None,
         confidences: Optional[Sequence[float]] = None,
     ) -> Metrics:
         """
-        Compute PCPS/APCPS at the latest time using preprocessed (filtered + smoothed) data
-        and update hysteresis color state. Returns a Metrics snapshot.
+        Compute PCPS/APCPS at the latest time and update hysteresis state.
+        - If times/values provided: processes that array (useful for batch/offline).
+        - If omitted: uses internal buffers (incremental mode).
         """
         m = Metrics(state=self.current_state)
 
-        t_proc, y_proc = self._preprocess(times, values, confidences)
+        # --- choose data source ---
+        if times is None or values is None:
+            # use incremental buffers
+            t_proc, y_proc, c_proc = (
+                list(self._times), list(self._values), list(self._confs)
+            )
+        else:
+            # external data (offline batch call)
+            t_proc, y_proc, c_proc = list(times), list(values), list(confidences) if confidences is not None else None
+
+        if len(t_proc) == 0:
+            return m
+
+        # preprocess (confidence filtering + smoothing)
+        t_proc, y_proc = self._preprocess(t_proc, y_proc, c_proc)
+
         if len(t_proc) == 0:
             return m
 
@@ -285,6 +308,25 @@ class PCPSCalculator:
 
         m.state = self.current_state
         return m
+
+    def step_update(self, t: float, y: float, conf: Optional[float] = None) -> Metrics:
+        """
+        Incrementally add one new sample to internal buffers and update metrics.
+        Keeps only recent samples within baseline/apcps windows for efficiency.
+        """
+        self._times.append(t)
+        self._values.append(y)
+        self._confs.append(conf)
+
+        # prune old samples
+        window_span = max(self.baseline_win, self.apcps_win) + 0.5
+        while self._times and (t - self._times[0] > window_span):
+            self._times.popleft()
+            self._values.popleft()
+            self._confs.popleft()
+
+        # call update() with no args → uses buffers
+        return self.update()
 
     # --- plotting helper (unchanged) ---
     def mask_window_segments(self, t_window, y_window, tmin, tmax):
