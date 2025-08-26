@@ -99,9 +99,9 @@ python plot_data.py mysession --session-number 000   --ref-baseline-file ~/recor
 ## Metrics
 
 - **PCPS**:  
-  \[
-  \text{PCPS}(t) = 100 \times \frac{y(t) - \text{baseline}}{\text{baseline}}
-  \]
+$$
+PCPS(t) = 100 \times \frac{y(t) - baseline}{baseline}
+$$
 
 - **APCPS (sliding)**:  
   Average PCPS over the **last** `apcps_win` seconds (causal, works online).
