@@ -108,7 +108,7 @@ def main():
         alert_up=args.alert_up,
         alert_down=args.alert_down,
         continuous_baseline=args.continuous_baseline,
-        forward_apcps=args.forward_apcps
+        #forward_apcps=args.forward_apcps
     )
 
     pc = PupilCoreClient()
