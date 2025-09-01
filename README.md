@@ -30,8 +30,8 @@ It implements **PCPS** (Percent Change in Pupil Size) and **APCPS** (Average PCP
 Clone the repo and install dependencies (Python 3.8+ recommended):
 
 ```bash
-git clone https://github.com/<your-username>/pupil-metrics.git
-cd pupil-metrics
+git clone https://github.com/<your-username>/utokyo_pupil_metrics.git
+cd utokyo_pupil_metrics
 pip install -r requirements.txt
 ```
 
